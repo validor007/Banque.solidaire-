@@ -1,0 +1,24 @@
+{% include 'navbar.html' %}
+<link rel="stylesheet" href="/static/style.css">
+<div class="container">
+  <h2>Espace Administrateur</h2>
+  <table>
+    <tr>
+      <th>Nom</th><th>Email</th><th>Solde (€)</th><th>Créditer</th>
+    </tr>
+    {% for u in users %}
+    <tr>
+      <td>{{ u[0] }}</td>
+      <td>{{ u[1] }}</td>
+      <td>{{ u[2] }}</td>
+      <td>
+        <form method="POST" action="/admin/credit">
+          <input type="hidden" name="email" value="{{ u[1] }}">
+          <input type="number" name="amount" placeholder="Montant" required>
+          <button type="submit" class="btn">Créditer</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
