@@ -1,361 +1,263 @@
-# app.py
 from flask import Flask, render_template, request, redirect, url_for, session, flash
-import sqlite3, os, smtplib
+from flask_session import Session
+import sqlite3
+import secrets
+from datetime import datetime
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
+import os
+import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET", "change_this_in_production")
+app.secret_key = os.environ.get('SESSION_SECRET', secrets.token_hex(16))
+app.config['SESSION_TYPE'] = 'filesystem'
+Session(app)
 
-DB_PATH = "banque.db"
+DATABASE = 'database.db'
 
 # -------------------------
-# Helpers DB
+# DATABASE HELPERS
 # -------------------------
-def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
+def get_db():
+    conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    if not os.path.exists(DB_PATH):
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("""
-            CREATE TABLE users (
+    with get_db() as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
+                username TEXT UNIQUE NOT NULL,
                 email TEXT UNIQUE NOT NULL,
                 password TEXT NOT NULL,
-                balance REAL DEFAULT 0
+                balance REAL DEFAULT 0.0,
+                is_admin INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """)
-        c.execute("""
-            CREATE TABLE donations (
+        ''')
+        
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                amount REAL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            )
-        """)
-        c.execute("""
-            CREATE TABLE transfers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sender_id INTEGER,
-                receiver_id INTEGER,
-                amount REAL,
+                sender_id INTEGER NOT NULL,
+                receiver_id INTEGER NOT NULL,
+                amount REAL NOT NULL,
                 status TEXT DEFAULT 'pending',
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(sender_id) REFERENCES users(id),
-                FOREIGN KEY(receiver_id) REFERENCES users(id)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (sender_id) REFERENCES users (id),
+                FOREIGN KEY (receiver_id) REFERENCES users (id)
             )
-        """)
-        c.execute("""
-            CREATE TABLE credits (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                admin_id INTEGER,
-                user_id INTEGER,
-                amount REAL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(user_id) REFERENCES users(id)
+        ''')
+        
+        cursor = conn.execute('SELECT COUNT(*) as count FROM users WHERE is_admin = 1')
+        admin_count = cursor.fetchone()['count']
+        
+        if admin_count == 0:
+            hashed_password = generate_password_hash('admin123')
+            conn.execute(
+                'INSERT INTO users (username, email, password, balance, is_admin) VALUES (?, ?, ?, ?, ?)',
+                ('admin', 'admin@bank.com', hashed_password, 1000000.0, 1)
             )
-        """)
+        
         conn.commit()
-        conn.close()
-
-init_db()
 
 # -------------------------
-# Email (Zoho) helper
+# EMAIL HELPER (Zoho)
 # -------------------------
-ZOHO_EMAIL = os.environ.get("ZOHO_EMAIL")        # ex: banquesolidairee@zohomail.com
-ZOHO_PASSWORD = os.environ.get("ZOHO_PASSWORD")  # mot de passe d'application Zoho
+ZOHO_EMAIL = os.environ.get('ZOHO_EMAIL')
+ZOHO_PASSWORD = os.environ.get('ZOHO_PASSWORD')
 
 def send_email(to_email: str, subject: str, body: str):
-    """Envoie un email via SMTP Zoho. Si les variables d'environnement ne sont pas définies,
-    on log et on ne plante pas l'application (mode démonstration)."""
     if not ZOHO_EMAIL or not ZOHO_PASSWORD:
-        app.logger.warning("ZOHO_EMAIL ou ZOHO_PASSWORD non définis — email non envoyé.")
-        app.logger.info(f"[Email skip] to={to_email} subject={subject} body={body}")
+        app.logger.warning("ZOHO_EMAIL or ZOHO_PASSWORD not defined. Email not sent.")
         return False
-
-    msg = MIMEMultipart()
-    msg["From"] = ZOHO_EMAIL
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
     try:
-        server = smtplib.SMTP_SSL("smtp.zoho.com", 465, timeout=10)
+        msg = MIMEMultipart()
+        msg['From'] = ZOHO_EMAIL
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+
+        server = smtplib.SMTP_SSL('smtp.zoho.com', 465)
         server.login(ZOHO_EMAIL, ZOHO_PASSWORD)
         server.sendmail(ZOHO_EMAIL, to_email, msg.as_string())
         server.quit()
-        app.logger.info(f"Email envoyé à {to_email} (subject: {subject})")
+        app.logger.info(f"Email sent to {to_email}")
         return True
     except Exception as e:
-        app.logger.error(f"Erreur envoi email à {to_email}: {e}")
+        app.logger.error(f"Error sending email to {to_email}: {e}")
         return False
 
 # -------------------------
-# Utilitaires
+# DECORATORS
 # -------------------------
-def get_current_user():
-    uid = session.get("user_id")
-    if not uid:
-        return None
-    conn = get_db_connection()
-    user = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
-    conn.close()
-    return user
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            flash('Please login to access this page.', 'error')
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
 
-def is_admin():
-    u = get_current_user()
-    return u and u["email"] == os.environ.get("ADMIN_EMAIL", "admin@banque.com")
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            flash('Please login to access this page.', 'error')
+            return redirect(url_for('login'))
+        with get_db() as conn:
+            user = conn.execute('SELECT is_admin FROM users WHERE id = ?', (session['user_id'],)).fetchone()
+            if not user or user['is_admin'] != 1:
+                flash('Access denied. Admin privileges required.', 'error')
+                return redirect(url_for('dashboard'))
+        return f(*args, **kwargs)
+    return decorated_function
 
 # -------------------------
-# Routes publiques
+# ROUTES
 # -------------------------
-@app.route("/")
+@app.route('/')
 def index():
-    return render_template("index.html")
+    return render_template('index.html')
 
-@app.route("/register", methods=["GET","POST"])
+@app.route('/register', methods=['GET', 'POST'])
 def register():
-    if request.method == "POST":
-        name = request.form.get("name","").strip()
-        email = request.form.get("email","").strip().lower()
-        password = request.form.get("password","")
-        if not (name and email and password):
-            flash("Tous les champs sont requis.")
-            return redirect(url_for("register"))
-        conn = get_db_connection()
+    if request.method == 'POST':
+        username = request.form.get('username')
+        email = request.form.get('email')
+        password = request.form.get('password')
+        confirm_password = request.form.get('confirm_password')
+        
+        if not username or not email or not password:
+            flash('All fields are required.', 'error')
+            return redirect(url_for('register'))
+        
+        if password != confirm_password:
+            flash('Passwords do not match.', 'error')
+            return redirect(url_for('register'))
+        
+        hashed_password = generate_password_hash(password)
+        
         try:
-            conn.execute("INSERT INTO users (name, email, password) VALUES (?, ?, ?)", (name, email, password))
-            conn.commit()
-            # send welcome email
-            subject = "Bienvenue à Banque Solidaire"
-            body = f"Bonjour {name},\n\nMerci d'avoir créé un compte sur Banque Solidaire (prototype éducatif).\n\nCordialement,\nBanque Solidaire"
-            send_email(email, subject, body)
-            flash("Compte créé avec succès. Un e-mail de confirmation a été envoyé (si configuré).")
-            return redirect(url_for("login"))
+            with get_db() as conn:
+                conn.execute(
+                    'INSERT INTO users (username, email, password, balance) VALUES (?, ?, ?, ?)',
+                    (username, email, hashed_password, 100.0)
+                )
+                conn.commit()
+            # Send welcome email
+            send_email(email, "Welcome to Banque Solidaire", 
+                       f"Hello {username},\n\nWelcome! Your account has been created with a $100 bonus.")
+            flash('Registration successful! Please login.', 'success')
+            return redirect(url_for('login'))
         except sqlite3.IntegrityError:
-            flash("Cet email est déjà utilisé.")
-        finally:
-            conn.close()
-    return render_template("register.html")
+            flash('Username or email already exists.', 'error')
+            return redirect(url_for('register'))
+    
+    return render_template('register.html')
 
-@app.route("/login", methods=["GET","POST"])
+@app.route('/login', methods=['GET', 'POST'])
 def login():
-    if request.method == "POST":
-        email = request.form.get("email","").strip().lower()
-        password = request.form.get("password","")
-        conn = get_db_connection()
-        user = conn.execute("SELECT * FROM users WHERE email=? AND password=?", (email, password)).fetchone()
-        conn.close()
-        if user:
-            session["user_id"] = user["id"]
-            flash("Connexion réussie.")
-            return redirect(url_for("dashboard"))
-        else:
-            flash("Email ou mot de passe incorrect.")
-    return render_template("login.html")
+    if request.method == 'POST':
+        email = request.form.get('email')
+        password = request.form.get('password')
+        
+        if not email or not password:
+            flash('Email and password are required.', 'error')
+            return redirect(url_for('login'))
+        
+        with get_db() as conn:
+            user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
+            if user and check_password_hash(user['password'], password):
+                session['user_id'] = user['id']
+                flash('Login successful!', 'success')
+                return redirect(url_for('dashboard'))
+            else:
+                flash('Invalid email or password.', 'error')
+                return redirect(url_for('login'))
+    
+    return render_template('login.html')
 
-@app.route("/logout")
-def logout():
-    session.clear()
-    flash("Déconnecté.")
-    return redirect(url_for("index"))
-
-# -------------------------
-# Dashboard, dons, transferts
-# -------------------------
-@app.route("/dashboard")
+@app.route('/dashboard')
+@login_required
 def dashboard():
-    user = get_current_user()
-    if not user:
-        return redirect(url_for("login"))
-    conn = get_db_connection()
-    donations = conn.execute("SELECT * FROM donations WHERE user_id=? ORDER BY timestamp DESC", (user["id"],)).fetchall()
-    conn.close()
-    return render_template("dashboard.html", user=user, donations=donations)
+    with get_db() as conn:
+        user = conn.execute('SELECT * FROM users WHERE id = ?', (session['user_id'],)).fetchone()
+        sent_transactions = conn.execute('''
+            SELECT t.*, u.username as receiver_name 
+            FROM transactions t 
+            JOIN users u ON t.receiver_id = u.id 
+            WHERE t.sender_id = ? 
+            ORDER BY t.created_at DESC
+        ''', (session['user_id'],)).fetchall()
+        received_transactions = conn.execute('''
+            SELECT t.*, u.username as sender_name 
+            FROM transactions t 
+            JOIN users u ON t.sender_id = u.id 
+            WHERE t.receiver_id = ? AND t.status = 'approved'
+            ORDER BY t.created_at DESC
+        ''', (session['user_id'],)).fetchall()
+    return render_template('dashboard.html', user=user, sent_transactions=sent_transactions, received_transactions=received_transactions)
 
-@app.route("/donate", methods=["POST"])
-def donate():
-    user = get_current_user()
-    if not user:
-        return redirect(url_for("login"))
-    try:
-        amount = float(request.form.get("amount","0"))
-    except:
-        flash("Montant invalide.")
-        return redirect(url_for("dashboard"))
-    if amount <= 0:
-        flash("Montant invalide.")
-        return redirect(url_for("dashboard"))
-    conn = get_db_connection()
-    # simple check balance
-    u = conn.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
-    if u["balance"] < amount:
-        flash("Solde insuffisant.")
-        conn.close()
-        return redirect(url_for("dashboard"))
-    conn.execute("UPDATE users SET balance = balance - ? WHERE id=?", (amount, user["id"]))
-    conn.execute("INSERT INTO donations (user_id, amount) VALUES (?, ?)", (user["id"], amount))
-    conn.commit()
-    conn.close()
-    flash(f"Merci ! Vous avez donné {amount} €.")
-    return redirect(url_for("dashboard"))
-
-@app.route("/transfer", methods=["GET","POST"])
+@app.route('/transfer', methods=['GET', 'POST'])
+@login_required
 def transfer():
-    user = get_current_user()
-    if not user:
-        return redirect(url_for("login"))
-    conn = get_db_connection()
-    users = conn.execute("SELECT * FROM users WHERE id != ?", (user["id"],)).fetchall()
-    if request.method == "POST":
+    if request.method == 'POST':
+        receiver_username = request.form.get('receiver_username')
+        amount_str = request.form.get('amount')
+        
+        if not amount_str:
+            flash('Amount is required.', 'error')
+            return redirect(url_for('transfer'))
+        
         try:
-            receiver_id = int(request.form.get("receiver"))
-            amount = float(request.form.get("amount","0"))
-        except:
-            flash("Données invalides.")
-            conn.close()
-            return redirect(url_for("transfer"))
-        if amount <= 0:
-            flash("Montant invalide.")
-            conn.close()
-            return redirect(url_for("transfer"))
-        sender = conn.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
-        if sender["balance"] < amount:
-            flash("Solde insuffisant.")
-            conn.close()
-            return redirect(url_for("transfer"))
-        # create transfer pending for admin approval
-        conn.execute("INSERT INTO transfers (sender_id, receiver_id, amount, status) VALUES (?, ?, ?, 'pending')",
-                     (user["id"], receiver_id, amount))
-        conn.commit()
-        # notify receiver by email immediately that a transfer has been initiated (educatif)
-        receiver = conn.execute("SELECT * FROM users WHERE id=?", (receiver_id,)).fetchone()
-        if receiver:
-            subj = "Un transfert vous a été envoyé (en attente)"
-            body = (f"Bonjour {receiver['name']},\n\n"
-                    f"Un transfert de {amount} € a été initié en votre faveur par {sender['name']}. "
-                    "Le paiement est en attente de validation administrative (prototype éducatif).\n\n"
-                    "Cordialement,\nBanque Solidaire")
-            send_email(receiver["email"], subj, body)
-        flash("Transfert soumis à validation administrative. Le destinataire a été notifié (si email configuré).")
-    conn.close()
-    return render_template("transfer.html", users=users, user=user)
-
-# -------------------------
-# Admin routes
-# -------------------------
-@app.route("/admin/transfers", methods=["GET","POST"])
-def admin_transfers():
-    if not is_admin():
-        flash("Accès admin requis.")
-        return redirect(url_for("login"))
-    conn = get_db_connection()
-    transfers = conn.execute("""
-        SELECT t.*, s.name as sender_name, r.name as receiver_name
-        FROM transfers t
-        JOIN users s ON t.sender_id = s.id
-        JOIN users r ON t.receiver_id = r.id
-        WHERE t.status='pending'
-        ORDER BY t.timestamp ASC
-    """).fetchall()
-    if request.method == "POST":
-        try:
-            transfer_id = int(request.form.get("transfer_id"))
-        except:
-            flash("ID transfert invalide.")
-            conn.close()
-            return redirect(url_for("admin_transfers"))
-        action = request.form.get("action")
-        tr = conn.execute("SELECT * FROM transfers WHERE id=?", (transfer_id,)).fetchone()
-        if not tr:
-            flash("Transfert introuvable.")
-            conn.close()
-            return redirect(url_for("admin_transfers"))
-        if action == "approve":
-            # debit sender, credit receiver
-            conn.execute("UPDATE users SET balance = balance - ? WHERE id=?", (tr["amount"], tr["sender_id"]))
-            conn.execute("UPDATE users SET balance = balance + ? WHERE id=?", (tr["amount"], tr["receiver_id"]))
-            conn.execute("UPDATE transfers SET status='approved' WHERE id=?", (transfer_id,))
+            amount = float(amount_str)
+            if amount <= 0:
+                flash('Amount must be greater than zero.', 'error')
+                return redirect(url_for('transfer'))
+        except ValueError:
+            flash('Invalid amount.', 'error')
+            return redirect(url_for('transfer'))
+        
+        with get_db() as conn:
+            sender = conn.execute('SELECT * FROM users WHERE id = ?', (session['user_id'],)).fetchone()
+            receiver = conn.execute('SELECT * FROM users WHERE username = ?', (receiver_username,)).fetchone()
+            
+            if not receiver:
+                flash('Receiver not found.', 'error')
+                return redirect(url_for('transfer'))
+            
+            if receiver['id'] == sender['id']:
+                flash('You cannot transfer to yourself.', 'error')
+                return redirect(url_for('transfer'))
+            
+            if sender['balance'] < amount:
+                flash('Insufficient balance.', 'error')
+                return redirect(url_for('transfer'))
+            
+            conn.execute(
+                'UPDATE users SET balance = balance - ? WHERE id = ?',
+                (amount, sender['id'])
+            )
+            
+            conn.execute(
+                'INSERT INTO transactions (sender_id, receiver_id, amount, status) VALUES (?, ?, ?, ?)',
+                (sender['id'], receiver['id'], amount, 'pending')
+            )
+            
             conn.commit()
-            # notify receiver
-            receiver = conn.execute("SELECT * FROM users WHERE id=?", (tr["receiver_id"],)).fetchone()
-            sender = conn.execute("SELECT * FROM users WHERE id=?", (tr["sender_id"],)).fetchone()
-            if receiver:
-                subj = "Transfert reçu"
-                body = (f"Bonjour {receiver['name']},\n\n"
-                        f"Votre compte a été crédité de {tr['amount']:.2f} € de la part de {sender['name']}.\n\nCordialement,\nBanque Solidaire")
-                send_email(receiver["email"], subj, body)
-            flash("Transfert approuvé et destinataire notifié (si email configuré).")
-        else:
-            conn.execute("UPDATE transfers SET status='rejected' WHERE id=?", (transfer_id,))
-            conn.commit()
-            flash("Transfert rejeté.")
-    conn.close()
-    return render_template("admin_transfers.html", transfers=transfers)
+            
+            # Notify receiver via email
+            send_email(receiver['email'], "New Transfer Pending",
+                       f"Hello {receiver['username']},\n\nYou have received a transfer of ${amount:.2f} from {sender['username']}. It is pending admin approval.")
+            
+            flash(f'Transfer of ${amount:.2f} to {receiver_username} initiated. Awaiting admin approval.', 'success')
+            return redirect(url_for('dashboard'))
+    
+    return render_template('transfer.html')
 
-@app.route("/admin/credits", methods=["GET","POST"])
-def admin_credits():
-    if not is_admin():
-        flash("Accès admin requis.")
-        return redirect(url_for("login"))
-    conn = get_db_connection()
-    users = conn.execute("SELECT * FROM users ORDER BY name").fetchall()
-    if request.method == "POST":
-        try:
-            user_id = int(request.form.get("user_id"))
-            amount = float(request.form.get("amount","0"))
-        except:
-            flash("Données invalides.")
-            conn.close()
-            return redirect(url_for("admin_credits"))
-        if amount <= 0:
-            flash("Montant invalide.")
-            conn.close()
-            return redirect(url_for("admin_credits"))
-        conn.execute("UPDATE users SET balance = balance + ? WHERE id=?", (amount, user_id))
-        conn.execute("INSERT INTO credits (admin_id, user_id, amount) VALUES (?, ?, ?)",
-                     (session.get("user_id"), user_id, amount))
-        conn.commit()
-        # notify user
-        u = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-        if u:
-            subj = "Votre compte a été crédité"
-            body = (f"Bonjour {u['name']},\n\nVotre compte a été crédité de {amount:.2f} € par l'administrateur.\n\nCordialement,\nBanque Solidaire")
-            send_email(u["email"], subj, body)
-        flash("Compte crédité et utilisateur notifié (si email configuré).")
-    credits = conn.execute("""
-        SELECT c.*, u.name as user_name
-        FROM credits c
-        JOIN users u ON c.user_id = u.id
-        ORDER BY c.timestamp DESC
-    """).fetchall()
-    conn.close()
-    return render_template("admin_credits.html", users=users, credits=credits)
-
-# -------------------------
-# Contact
-# -------------------------
-@app.route("/contact", methods=["GET","POST"])
-def contact():
-    if request.method == "POST":
-        name = request.form.get("name","")
-        email = request.form.get("email","")
-        message = request.form.get("message","")
-        app.logger.info(f"[CONTACT] {name} <{email}>: {message}")
-        flash("Message reçu. Merci !")
-        return redirect(url_for("contact"))
-    return render_template("contact.html")
-
-# -------------------------
-# Run (local)
-# -------------------------
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+@app
